@@ -4,8 +4,6 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from minifold.utils import init
-from minifold.model.kernels.gating import gating_kernel
-from minifold.model.kernels.mlp import mlp_kernel
 
 
 def mlp(x, w1, w2, b1, b2, wn, bn):
@@ -62,6 +60,9 @@ def triangular(
 
 def mlp_kernel_func(x, w1, w2, b1, b2, wn, bn):
     """Perform a two-layer MLP with a residual connection."""
+    # Imported here so that Triton (~1.1 s) loads only when --kernels is used.
+    from minifold.model.kernels.mlp import mlp_kernel
+
     w1 = w1.t().contiguous()
     w2 = w2.t().contiguous()
     return mlp_kernel(x, w1, w2, b1, b2, wn, bn)
@@ -84,6 +85,8 @@ def triangular_kernel_func(
     no_b,
 ):
     """Perform a triangular update"""
+    from minifold.model.kernels.gating import gating_kernel
+
     # Tranpose weights
     gi_w = gi_w.t().contiguous()
     pi_w = pi_w.t().contiguous()

@@ -90,6 +90,27 @@ def default_dtype(dtype):
         torch.set_default_dtype(old)
 
 
+@contextmanager
+def skip_init():
+    """Make torch.nn.init functions no-ops while modules are constructed.
+
+    Only safe for modules whose every parameter is overwritten afterwards by a
+    strict load_state_dict. The ESM-2 loader loads strictly, and without this
+    torch spends ~10 s drawing 2.84e9 random values that are discarded at once.
+    """
+    import torch.nn.init as init
+
+    names = [n for n in dir(init) if n.endswith("_") and not n.startswith("_")]
+    saved = {n: getattr(init, n) for n in names}
+    for n in names:
+        setattr(init, n, lambda tensor, *a, **k: tensor)
+    try:
+        yield
+    finally:
+        for n, f in saved.items():
+            setattr(init, n, f)
+
+
 def create_model(
     checkpoint,
     device,
@@ -100,7 +121,9 @@ def create_model(
     offload_lm=False,
 ):
     # Load checkpoint
-    ckpt = torch.load(checkpoint, map_location="cpu")
+    # mmap: tensors are paged in only when touched, so the 1.73 GiB of Adam
+    # optimizer state stored in the released checkpoints is never read.
+    ckpt = torch.load(checkpoint, map_location="cpu", mmap=True, weights_only=False)
     hparams = ckpt["hyper_parameters"]
 
     if kernels:
@@ -122,7 +145,7 @@ def create_model(
     _orig_loader = mf_model.load_model_and_alphabet
 
     def _low_prec_loader(model_name):
-        with default_dtype(DTYPES[lm_dtype]):
+        with default_dtype(DTYPES[lm_dtype]), skip_init():
             lm, alph = _orig_loader(model_name)
         return lm, alph
 

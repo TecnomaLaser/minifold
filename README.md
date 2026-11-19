@@ -67,6 +67,19 @@ without which allocator fragmentation caps inference at 1024 residues rather
 than 1280. Beyond ~1280 residues the folding trunk's fp32 triangular updates,
 not the encoder, are what bounds the run.
 
+### Start-up time
+
+Time to first prediction (48L, warm file cache) is 6.9 s, down from 23.7 s.
+Most of the old cost was torch drawing random initial values for all 2.84e9
+ESM-2 parameters (9.8 s), which the checkpoint load then overwrote. The encoder
+is now built without that initialisation. Both checkpoints are memory-mapped,
+so the 1.73 GiB of optimizer state left in the released MiniFold checkpoints is
+never read. Triton is imported only when `--kernels` is passed. Predictions are
+byte-identical to before.
+
+Start-up is paid once per process, so put all sequences in one FASTA file
+rather than calling `predict.py` once per sequence.
+
 ### Accuracy
 
 fp16 is bit-exact with the released ESM-2 weights, so it is the faithful

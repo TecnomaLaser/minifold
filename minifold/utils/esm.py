@@ -163,6 +163,11 @@ class ESM2(nn.Module):
 
 
 def load_hub_workaround(url):
+    # Fast path: memory-map an already-downloaded file instead of reading the
+    # whole 5.7 GB pickle into RAM before load_state_dict copies it again.
+    cached = Path(torch.hub.get_dir()) / "checkpoints" / Path(url).name
+    if cached.exists():
+        return torch.load(cached, map_location="cpu", mmap=True, weights_only=False)
     try:
         data = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
     except RuntimeError:

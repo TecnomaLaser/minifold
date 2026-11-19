@@ -25,8 +25,8 @@ dependencies = [
     "einops",
 ]
 
-[tool.setuptools]
-packages = ["minifold"]
+[tool.setuptools.packages.find]
+include = ["minifold*"]
 
 [tool.setuptools.package-data]
 minifold = ["utils/stereo_chemical_props.txt"]

@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from Bio import SeqIO
+from contextlib import contextmanager
+
+import esm.data as esm_data
 from esm.pretrained import load_model_and_alphabet
 from tqdm import tqdm
 
@@ -16,6 +19,8 @@ from minifold.utils.residue_constants import restype_order_with_x
 from minifold.utils.protein import Protein, to_pdb
 from minifold.data.config import model_config
 from minifold.data.of_data import of_inference
+
+from minifold.lowmem import offload_lm_layers, forward_streaming
 from minifold.utils.residue_constants import restype_order_with_x_inverse
 
 
@@ -71,7 +76,29 @@ def get_device():
         return torch.device("cpu")
 
 
-def create_model(checkpoint, device, compile=False, kernels=False):
+DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+@contextmanager
+def default_dtype(dtype):
+    """Build modules directly in `dtype` instead of fp32."""
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old)
+
+
+def create_model(
+    checkpoint,
+    device,
+    compile=False,
+    kernels=False,
+    lm_dtype="fp16",
+    trunk_dtype="fp32",
+    offload_lm=False,
+):
     # Load checkpoint
     ckpt = torch.load(checkpoint, map_location="cpu")
     hparams = ckpt["hyper_parameters"]
@@ -86,17 +113,36 @@ def create_model(checkpoint, device, compile=False, kernels=False):
         low_prec=False,
         long_sequence_inference=False,
     )
-    model = MiniFoldModel(
-        esm_model_name=hparams["esm_model_name"],
-        num_blocks=hparams["num_blocks"],
-        no_bins=hparams["no_bins"],
-        config_of=config_of,
-        use_structure_module=True,
-        kernels=kernels,
-    )
 
-    # Initialize alphabet
-    _, alphabet = load_model_and_alphabet(hparams["esm_model_name"])
+    # Build the frozen ESM-2 encoder directly in the target dtype. The stock
+    # path builds it in fp32 (10.6 GiB) before any cast, which alone exceeds
+    # host RAM headroom and GPU capacity on small machines.
+    import minifold.model.model as mf_model
+
+    _orig_loader = mf_model.load_model_and_alphabet
+
+    def _low_prec_loader(model_name):
+        with default_dtype(DTYPES[lm_dtype]):
+            lm, alph = _orig_loader(model_name)
+        return lm, alph
+
+    mf_model.load_model_and_alphabet = _low_prec_loader
+    try:
+        model = MiniFoldModel(
+            esm_model_name=hparams["esm_model_name"],
+            num_blocks=hparams["num_blocks"],
+            no_bins=hparams["no_bins"],
+            config_of=config_of,
+            use_structure_module=True,
+            kernels=kernels,
+        )
+    finally:
+        mf_model.load_model_and_alphabet = _orig_loader
+
+    # Initialize alphabet. The stock code calls load_model_and_alphabet here,
+    # which downloads and instantiates a *second* copy of the 2.8B-parameter
+    # encoder only to throw it away; the alphabet is a fixed vocabulary.
+    alphabet = esm_data.Alphabet.from_architecture("ESM-1b")
 
     # Load pretrained weights
     state_dict = ckpt["state_dict"]
@@ -105,6 +151,7 @@ def create_model(checkpoint, device, compile=False, kernels=False):
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict, strict=False)
+    del ckpt, state_dict
 
     # Compile folding block
     if compile:
@@ -114,9 +161,30 @@ def create_model(checkpoint, device, compile=False, kernels=False):
             fullgraph=True,
         )
 
-    # Move model to device
-    model = model.to(device)
+    # --- low-VRAM changes -------------------------------------------------
+    # The ESM-2 3B weights ship as fp16 but fair-esm inflates them to fp32
+    # (10.6 GiB). The trunk already runs under bf16 autocast, so keeping fp32
+    # master weights for the frozen LM buys nothing at inference.
+    model.lm.to(DTYPES[lm_dtype])
+    model.fc_s.to(DTYPES[trunk_dtype])
+    model.fc_z.to(DTYPES[trunk_dtype])
+    model.fold.to(DTYPES[trunk_dtype])
     model.eval()
+
+    if offload_lm:
+        # Trunk on GPU, LM transformer layers streamed per forward pass
+        model.fc_s.to(device)
+        model.fc_z.to(device)
+        model.fold.to(device)
+        model.sz_project.to(device)
+        model.structure_module.to(device)
+        model.aux_heads.to(device)
+        model.lm.embed_tokens.to(device)
+        model.lm.emb_layer_norm_after.to(device)
+        offload_lm_layers(model.lm, device)
+    else:
+        model = model.to(device)
+    # ----------------------------------------------------------------------
 
     return alphabet, model
 
@@ -217,6 +285,37 @@ def prepare_input(seq, config, alphabet):
     is_flag=True,
     help="Whether to use kernels. Default is False.",
 )
+@click.option(
+    "--lm_dtype",
+    type=click.Choice(["fp32", "bf16", "fp16"]),
+    default="fp16",
+    help=(
+        "Weight dtype for the frozen ESM-2 encoder. Default fp16, which is the "
+        "dtype the ESM-2 weights are distributed in. fp32 reproduces upstream."
+    ),
+)
+@click.option(
+    "--trunk_dtype",
+    type=click.Choice(["fp32", "bf16"]),
+    default="fp32",
+    help="Weight dtype for the folding trunk. Default fp32.",
+)
+@click.option(
+    "--stream_attn",
+    is_flag=True,
+    help="Project ESM attention maps layer-by-layer instead of stacking them.",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["auto", "cuda", "cpu"]),
+    default="auto",
+    help="Compute device. Default auto.",
+)
+@click.option(
+    "--offload_lm",
+    is_flag=True,
+    help="Stream ESM layers from CPU one at a time (frees ~5 GiB VRAM).",
+)
 def predict(
     fasta: str,
     out_dir: str = "./minifold_predictions",
@@ -226,6 +325,11 @@ def predict(
     compile: bool = False,
     model_size: str = "48L",
     kernels: bool = False,
+    lm_dtype: str = "fp16",
+    trunk_dtype: str = "fp32",
+    offload_lm: bool = False,
+    stream_attn: bool = False,
+    device: str = "auto",
     num_recycling: int = 3,
 ) -> None:
     """Run predictions with Minifold."""
@@ -249,7 +353,7 @@ def predict(
     download(cache, model_size)
 
     # Detect device
-    device = get_device()
+    device = get_device() if device == "auto" else torch.device(device)
     print(f"Using device: {device}")
 
     # Load model
@@ -264,7 +368,21 @@ def predict(
 
     # Load checkpoint
     print("Load model...")
-    alphabet, model = create_model(checkpoint, device, compile)
+    alphabet, model = create_model(
+        checkpoint,
+        device,
+        compile=compile,
+        kernels=kernels,
+        lm_dtype=lm_dtype,
+        trunk_dtype=trunk_dtype,
+        offload_lm=offload_lm,
+    )
+    if device.type == "cuda":
+        print(
+            f"VRAM after load: {torch.cuda.memory_allocated() / 2**30:.2f} GiB"
+            f" (lm_dtype={lm_dtype}, trunk_dtype={trunk_dtype},"
+            f" offload_lm={offload_lm})"
+        )
 
     # Create batches
     config = model_config(
@@ -328,7 +446,11 @@ def predict(
         try:
             autocast_device = "cuda" if device.type == "cuda" else ("cpu" if device.type == "cpu" else "mps")
             with torch.autocast(autocast_device, dtype=torch.bfloat16):
-                out = model(model_batch, num_recycling=num_recycling)
+                out = (
+                    forward_streaming(model, model_batch, num_recycling=num_recycling)
+                    if stream_attn
+                    else model(model_batch, num_recycling=num_recycling)
+                )
                 out_pos = out.pop("final_atom_positions")
                 out_mask = out.pop("final_atom_mask")
                 plddt = out.pop("plddt")
@@ -358,6 +480,14 @@ def predict(
             traceback.print_exc()
             print(f"Failed to predict batch: {e}")
             continue
+
+        if device.type == "cuda":
+            lengths = [len(t.seq) for t in batch]
+            print(
+                f"batch n={len(batch)} max_len={max(lengths)} "
+                f"peak VRAM={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+            )
+            torch.cuda.reset_peak_memory_stats()
 
 
 if __name__ == "__main__":
